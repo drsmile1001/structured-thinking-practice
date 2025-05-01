@@ -13,9 +13,29 @@ export type Invoice = {
 };
 
 export type InvoiceResult = Result<Invoice, "OVER_LIMIT">;
-export type Result<T, E> =
-  | { success: true; data: T }
-  | { success: false; error: E };
+export type Result<T, E> = OkResult<T> | FailResult<E>;
+export type OkResult<T> = {
+  success: true;
+  data: T;
+};
+export type FailResult<E> = {
+  success: false;
+  error: E;
+};
+
+export function Ok<T>(data: T): OkResult<T> {
+  return {
+    success: true,
+    data,
+  };
+}
+
+export function Fail<E>(error: E): FailResult<E> {
+  return {
+    success: false,
+    error,
+  };
+}
 
 export function calculateSum(items: Item[]) {
   return items.reduce((acc, item) => acc + item.unitPrice * item.quantity, 0);
@@ -25,7 +45,7 @@ export function calculateTax(total: number) {
   return total * 0.05;
 }
 
-export function vaildateInvoiceNumbers(total: number, tax: number) {
+export function vaildateInvoiceNumbers(total: number, tax: number): boolean {
   const taxedSum = total + tax;
   return taxedSum <= 50000;
 }
@@ -51,23 +71,77 @@ export async function buildInvoice(
     tax,
   };
 }
+type AsyncFunc<I, O> = (input: I) => Promise<O> | O;
+type AsyncProcessor<T> = AsyncFunc<T, T>;
+
+async function pipeAsync<TState>(
+  input: TState,
+  ...processors: AsyncProcessor<TState>[]
+): Promise<TState> {
+  let result = input;
+  for (const processor of processors) {
+    result = await processor(result);
+  }
+  return result;
+}
+
+async function conditionalProcessor<TState>(
+  input: TState,
+  predictor: AsyncFunc<TState, boolean>,
+  trulyFunc: AsyncProcessor<TState>,
+  falslyFunc: AsyncProcessor<TState>
+) {
+  const condition = await predictor(input);
+  if (condition) return await trulyFunc(input);
+  else return await falslyFunc(input);
+}
 
 export async function createInvoice(
   input: InvoiceInput,
   getSn: GetNextSerialNumber,
   getNow: GetNow
 ): Promise<InvoiceResult> {
-  const sum = calculateSum(input.items);
-  const tax = calculateTax(sum);
-  const vaild = vaildateInvoiceNumbers(sum, tax);
-  if (!vaild)
-    return {
-      error: "OVER_LIMIT",
-      success: false,
-    };
-  const invoice = await buildInvoice(getSn, getNow, input.items, sum, tax);
-  return {
-    success: true,
-    data: invoice,
-  };
+  const result = await pipeAsync(
+    {
+      items: input.items,
+      getSn,
+      getNow,
+      sum: 0,
+      tax: 0,
+      invoice: null as Invoice | null,
+      error: null as "OVER_LIMIT" | null,
+    },
+    (s) => {
+      const sum = calculateSum(s.items);
+      return { ...s, sum };
+    },
+    (s) => {
+      const tax = calculateTax(s.sum);
+      return { ...s, tax };
+    },
+    (s) =>
+      conditionalProcessor(
+        s,
+        () => vaildateInvoiceNumbers(s.sum, s.tax),
+        async (s) => {
+          const invoice = await buildInvoice(
+            s.getSn,
+            s.getNow,
+            s.items,
+            s.sum,
+            s.tax
+          );
+          return {
+            ...s,
+            invoice,
+          };
+        },
+        (s) => ({
+          ...s,
+          error: "OVER_LIMIT" as const,
+        })
+      )
+  );
+
+  return result.invoice ? Ok(result.invoice) : Fail(result.error!);
 }
